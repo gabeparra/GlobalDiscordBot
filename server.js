@@ -1,12 +1,20 @@
 // server.js
+require("dotenv").config(); // <-- loads .env
+
 const express = require("express");
+const axios = require("axios");
 const { Client, GatewayIntentBits } = require("discord.js");
 
-const DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN";
-const DISCORD_TARGET_CHANNEL_ID = "DISCORD_CHANNEL_ID_TO_POST_AGENT_REPLIES";
-
-const app = express();
-app.use(express.json());
+const {
+  TOKEN,
+  RESPOND_WEBHOOK_URL,
+  RESPOND_CHANNEL_ID,
+  RESPOND_API_TOKEN,
+  FORWARD_CHANNEL_ID,
+  DISCORD_REPLY_CHANNEL_ID,
+  RESPOND_OUTBOUND_TOKEN,
+  PORT
+} = process.env;
 
 // --- Discord client ---
 const client = new Client({
@@ -18,41 +26,94 @@ const client = new Client({
 });
 
 client.on("ready", () => {
-  console.log(`Discord bot logged in as ${client.user.tag}`);
+  console.log(`Discord bot online as ${client.user.tag}`);
 });
 
-// This is the endpoint you will put in "Destination Webhook URL"
+// --- Discord -> Respond.io: forward messages from FORWARD_CHANNEL_ID ---
+client.on("messageCreate", async (message) => {
+  if (message.author.bot) return;
+  if (!FORWARD_CHANNEL_ID || message.channel.id !== FORWARD_CHANNEL_ID) return;
+
+  try {
+    await axios.post(
+      RESPOND_WEBHOOK_URL,
+      {
+        channelId: RESPOND_CHANNEL_ID,
+        contactId: `discord-${message.author.id}`, // Custom ID
+        events: [
+          {
+            type: "message",
+            mId: message.id,
+            timestamp: Date.now(),
+            message: {
+              type: "text",
+              text: message.content,
+            },
+          },
+        ],
+        contact: {
+          firstName: message.author.username,
+        },
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${RESPOND_API_TOKEN}`,
+        },
+      }
+    );
+
+    console.log("Forwarded message from Discord to Respond.io");
+  } catch (err) {
+    console.error(
+      "Error forwarding to Respond.io:",
+      err.response?.data || err.message
+    );
+  }
+});
+
+// --- Express server: Respond.io -> Discord (outgoing webhook) ---
+const app = express();
+app.use(express.json());
+
 app.post("/respond-message", async (req, res) => {
   try {
-    // Basic auth check if you want – Respond.io will send Authorization: Bearer <API_TOKEN>
-    const bearer = req.headers.authorization || "";
-    const token = bearer.startsWith("Bearer ") ? bearer.slice(7) : null;
-    const EXPECTED_TOKEN = "YOUR_RESPOND_API_TOKEN"; // you'll fill this later
+    // Simple auth with bearer token
+    const authHeader = req.headers.authorization || "";
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
 
-    if (!token || token !== EXPECTED_TOKEN) {
+    if (!RESPOND_OUTBOUND_TOKEN || token !== RESPOND_OUTBOUND_TOKEN) {
       return res.status(401).send("Unauthorized");
     }
 
-    const { channelId, contactId, message } = req.body; // structure from docs
+    // Adjust these fields based on the exact payload Respond.io sends you
+    const { contactId, message } = req.body;
 
-    const ch = await client.channels.fetch(DISCORD_TARGET_CHANNEL_ID);
+    if (!DISCORD_REPLY_CHANNEL_ID) {
+      console.warn("DISCORD_REPLY_CHANNEL_ID not set");
+      return res.status(500).send("No reply channel configured");
+    }
+
+    const channel = await client.channels.fetch(DISCORD_REPLY_CHANNEL_ID);
 
     const text =
       message?.text ||
       `[non-text message from respond.io]\n${JSON.stringify(message)}`;
 
-    await ch.send(`**From respond.io contact ${contactId}:** ${text}`);
+    await channel.send(`**Reply for ${contactId}:** ${text}`);
 
-    // Respond.io expects 200 + mId in body
+    // Respond.io usually expects mId in response, can be any unique string
     return res.status(200).json({ mId: Date.now().toString() });
   } catch (err) {
-    console.error("Error handling /respond-message:", err);
+    console.error("Error in /respond-message:", err);
     return res.status(500).send("Error");
   }
 });
 
-const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`HTTP server listening on port ${PORT}`);
-  client.login(DISCORD_TOKEN);
+const port = PORT || 3000;
+app.listen(port, () => {
+  console.log(`HTTP server listening on port ${port}`);
+  client.login(TOKEN); // <-- uses .env TOKEN
 });
